@@ -1,27 +1,22 @@
 /**
- * pi-sticky-usermessage — Enhanced Sticky Header Extension
+ * pi-sticky-usermessage — Sticky Header Extension
  *
- * Shows your last user message as a persistent, interactive bar above the editor.
- * Features: persistence, scrollable view, syntax awareness, smart truncation,
- * message metadata, accessibility features, and sensitive data filtering.
- *
+ * Shows your last user message as a persistent bar above the editor in Pi.
  * Install:  pi install pi-sticky-usermessage
- * Or local: pi -e ./src/index.ts
+ * Local:    pi -e ./src/index.ts
  */
 
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import type { Component, TUI } from "@earendil-works/pi-tui";
-import { matchesKey, Key } from "@earendil-works/pi-tui";
+import { truncateToWidth } from "@earendil-works/pi-tui";
 
 // ═══════════════════════════════════════════════════════════════
-// Configuration Types
+// Types
 // ═══════════════════════════════════════════════════════════════
 
 interface StickyConfig {
   enabled: boolean;
   maxLines: number;
   maxWidth: number;
-  // New customization options
   showTimestamp: boolean;
   showMessageType: boolean;
   smartTruncation: boolean;
@@ -30,7 +25,6 @@ interface StickyConfig {
   truncateAtWordBoundary: boolean;
   filterSensitive: boolean;
   customPatterns?: string[];
-  // Theme colors
   timestampColor: string;
   metadataColor: string;
 }
@@ -43,10 +37,23 @@ interface MessageMetadata {
   hasCodeBlocks: boolean;
 }
 
+/** Serialized form for persistence (Date → ISO string). */
+interface SerializedMetadata {
+  prompt: string;
+  timestamp: string;
+  messageType: "new" | "follow-up" | "edit" | "retry";
+  turnNumber: number;
+  hasCodeBlocks: boolean;
+}
+
 interface SavedState {
   config: StickyConfig;
-  lastMetadata?: MessageMetadata;
+  lastMetadata?: SerializedMetadata;
 }
+
+// ═══════════════════════════════════════════════════════════════
+// Defaults
+// ═══════════════════════════════════════════════════════════════
 
 const DEFAULT_CONFIG: StickyConfig = {
   enabled: true,
@@ -65,97 +72,108 @@ const DEFAULT_CONFIG: StickyConfig = {
 };
 
 // ═══════════════════════════════════════════════════════════════
-// Sensitive Data Patterns
+// Sensitive Data Filtering
 // ═══════════════════════════════════════════════════════════════
 
-const SENSITIVE_PATTERNS = [
-  { pattern: /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g, replacement: "[email]" },
-  { pattern: /\b(?:\d{1,3}\.){3}\d{1,3}\b/g, replacement: "[ip]" },
-  { pattern: /\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/g, replacement: "[phone]" },
-  { pattern: /\b[A-Za-z0-9]{32,}\b/g, replacement: "[key]" }, // Likely API keys/tokens
-  { pattern: /sk-[a-zA-Z0-9]{20,}/g, replacement: "[sk-key]" }, // OpenAI-style keys
-  { pattern: /Bearer\s+[A-Za-z0-9._-]+/gi, replacement: "Bearer [token]" },
-  { pattern: /password["\s:=]+[^\s"']+/gi, replacement: "password [redacted]" },
-  { pattern: /api[_-]?key["\s:=]+[^\s"']+/gi, replacement: "api_key [redacted]" },
-  { pattern: /secret["\s:=]+[^\s"']+/gi, replacement: "secret [redacted]" },
-  { pattern: /token["\s:=]+[^\s"']+/gi, replacement: "token [redacted]" },
-];
+/**
+ * Pattern definitions stored as source strings.
+ * Fresh RegExp instances are created per invocation to avoid /g lastIndex bugs.
+ */
+interface SensitivePatternDef {
+  source: string;
+  flags: string;
+  replacement: string;
+}
 
-// ═══════════════════════════════════════════════════════════════
-// Custom Interactive Widget Component
-// ═══════════════════════════════════════════════════════════════
+const SENSITIVE_PATTERN_DEFS: readonly SensitivePatternDef[] = [
+  { source: "\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}\\b", flags: "g", replacement: "[email]" },
+  { source: "\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b", flags: "g", replacement: "[ip]" },
+  { source: "\\b(?:\\+?1[-.\\s]?)?\\(?\\d{3}\\)?[-.\\s]?\\d{3}[-.\\s]?\\d{4}\\b", flags: "g", replacement: "[phone]" },
+  // Prefixed secrets only — avoids false positives on long identifiers / hashes
+  { source: "\\b(?:sk-|ghp_|gho_|github_pat_|xox[bpsa]-)[A-Za-z0-9_-]{20,}\\b", flags: "g", replacement: "[key]" },
+  { source: "Bearer\\s+[A-Za-z0-9._-]+", flags: "gi", replacement: "Bearer [token]" },
+  { source: "(?:password|passwd|pwd)[\"'\\s:=]+[^\\s\"']+", flags: "gi", replacement: "password [redacted]" },
+  { source: "api[_-]?key[\"'\\s:=]+[^\\s\"']+", flags: "gi", replacement: "api_key [redacted]" },
+  { source: "secret[\"'\\s:=]+[^\\s\"']+", flags: "gi", replacement: "secret [redacted]" },
+  { source: "token[\"'\\s:=]+[^\\s\"']+", flags: "gi", replacement: "token [redacted]" },
+] as const;
 
-class StickyWidgetComponent implements Component {
-  private metadata: MessageMetadata;
-  private config: StickyConfig;
-  private theme: Theme;
-  private tui: TUI;
-  private cachedLines: string[] = [];
-  private cachedWidth = 0;
-  private version = 0;
-  private expanded = false;
-  private scrollOffset = 0;
-  private onExpandToggle: () => void;
+/** Max source length for custom regex patterns to mitigate ReDoS. */
+const MAX_CUSTOM_PATTERN_LENGTH = 200;
 
-  constructor(
-    metadata: MessageMetadata,
-    config: StickyConfig,
-    theme: Theme,
-    tui: TUI,
-    onExpandToggle: () => void,
-  ) {
-    this.metadata = metadata;
-    this.config = config;
-    this.theme = theme;
-    this.tui = tui;
-    this.onExpandToggle = onExpandToggle;
+function filterSensitiveData(text: string, customPatterns?: string[]): string {
+  let filtered = text;
+
+  for (const def of SENSITIVE_PATTERN_DEFS) {
+    filtered = filtered.replace(new RegExp(def.source, def.flags), def.replacement);
   }
 
-  handleInput(data: string): void {
-    // Handle keyboard interactions
-    if (matchesKey(data, Key.enter) || data === " " || data === "e" || data === "E") {
-      this.toggleExpand();
-    } else if (matchesKey(data, Key.up) && this.expanded) {
-      this.scrollOffset = Math.max(0, this.scrollOffset - 1);
-      this.invalidate();
-    } else if (matchesKey(data, Key.down) && this.expanded) {
-      const maxOffset = Math.max(0, this.getDisplayLines().length - this.config.maxLines);
-      this.scrollOffset = Math.min(maxOffset, this.scrollOffset + 1);
-      this.invalidate();
-    } else if (matchesKey(data, Key.escape) && this.expanded) {
-      this.expanded = false;
-      this.scrollOffset = 0;
-      this.invalidate();
-      this.onExpandToggle();
+  if (customPatterns) {
+    for (const pattern of customPatterns) {
+      if (pattern.length > MAX_CUSTOM_PATTERN_LENGTH) continue;
+      try {
+        filtered = filtered.replace(new RegExp(pattern, "gi"), "[redacted]");
+      } catch {
+        // Invalid regex — skip
+      }
     }
   }
 
-  private toggleExpand(): void {
-    this.expanded = !this.expanded;
-    this.scrollOffset = 0;
-    this.version++;
-    this.tui.requestRender();
-    this.onExpandToggle();
+  return filtered;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Widget Component (display-only — setWidget does not forward keys)
+// ═══════════════════════════════════════════════════════════════
+
+class StickyWidgetComponent {
+  private metadata: MessageMetadata;
+  private config: StickyConfig;
+  private theme: Theme;
+  private cachedLines: string[] | null = null;
+  private cachedWidth = -1;
+
+  constructor(metadata: MessageMetadata, config: StickyConfig, theme: Theme) {
+    this.metadata = metadata;
+    this.config = config;
+    this.theme = theme;
   }
 
-  invalidate(): void {
-    this.cachedWidth = 0;
-    this.cachedLines = [];
+  /** Called by the setWidget factory so theme changes are reflected. */
+  setTheme(theme: Theme): void {
+    this.theme = theme;
+    this.invalidate();
   }
 
   updateMetadata(metadata: MessageMetadata): void {
     this.metadata = metadata;
-    this.version++;
     this.invalidate();
   }
 
   updateConfig(config: StickyConfig): void {
     this.config = config;
-    this.version++;
     this.invalidate();
   }
 
-  private getDisplayLines(): string[] {
+  invalidate(): void {
+    this.cachedLines = null;
+    this.cachedWidth = -1;
+  }
+
+  render(width: number): string[] {
+    if (this.cachedLines !== null && this.cachedWidth === width) {
+      return this.cachedLines;
+    }
+
+    const lines = this.buildDisplayLines(width);
+    this.cachedLines = lines;
+    this.cachedWidth = width;
+    return lines;
+  }
+
+  // ─── Private helpers ─────────────────────────────────────
+
+  private buildDisplayLines(termWidth: number): string[] {
     const { prompt, timestamp, messageType, hasCodeBlocks } = this.metadata;
     const {
       maxLines,
@@ -166,184 +184,138 @@ class StickyWidgetComponent implements Component {
       codeBlockIndicator,
       prefixSymbol,
       truncateAtWordBoundary,
-      filterSensitive,
+      filterSensitive: shouldFilter,
       timestampColor,
       metadataColor,
     } = this.config;
 
+    // --- sensitive data ---
     let text = prompt;
-
-    // Filter sensitive data
-    if (filterSensitive) {
-      text = this.filterSensitiveData(text);
+    if (shouldFilter) {
+      text = filterSensitiveData(text, this.config.customPatterns);
     }
 
     const rawLines = text.split("\n");
     const displayLines: string[] = [];
 
-    // Build metadata line
+    // --- metadata line ---
     const metaParts: string[] = [];
     if (showTimestamp) {
-      const timeStr = timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      const timeStr = timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
       metaParts.push(this.theme.fg(timestampColor, timeStr));
     }
     if (showMessageType) {
-      const typeSymbol = messageType === "new" ? "●" : messageType === "follow-up" ? "→" : messageType === "edit" ? "✎" : "↺";
-      metaParts.push(this.theme.fg(metadataColor, `${typeSymbol} ${messageType}`));
+      const symbols: Record<string, string> = { new: "●", "follow-up": "→", edit: "✎", retry: "↺" };
+      metaParts.push(this.theme.fg(metadataColor, `${symbols[messageType] ?? "●"} ${messageType}`));
     }
     if (hasCodeBlocks && codeBlockIndicator) {
       metaParts.push(this.theme.fg("accent", "</>"));
     }
 
-    // Process content with syntax awareness
-    for (let i = 0; i < rawLines.length; i++) {
-      let line = rawLines[i];
-      const isCodeBlock = line.startsWith("```") || line.trim().startsWith("```");
-
-      if (isCodeBlock && codeBlockIndicator) {
-        // Highlight code block markers
-        line = this.theme.fg("accent", line);
-      } else if (smartTruncation) {
-        // Apply smart truncation with syntax highlighting
-        line = this.smartFormatLine(line, maxWidth, truncateAtWordBoundary);
-      } else {
-        // Simple truncation
-        line = this.truncateLine(line, maxWidth, truncateAtWordBoundary);
-      }
-
-      displayLines.push(line);
+    if (metaParts.length > 0) {
+      const metaLine =
+        this.theme.fg(metadataColor, prefixSymbol) +
+        " " +
+        metaParts.join(this.theme.fg("dim", " · "));
+      displayLines.push(truncateToWidth(metaLine, termWidth));
     }
 
-    // Combine metadata with content
-    if (metaParts.length > 0) {
-      const metaLine = this.theme.fg(metadataColor, prefixSymbol) + " " + metaParts.join(this.theme.fg("dim", " · "));
-      displayLines.unshift(metaLine);
+    // --- content lines ---
+    for (const rawLine of rawLines) {
+      let line: string;
+      const isCodeBlock = rawLine.startsWith("```") || rawLine.trim().startsWith("```");
+
+      if (isCodeBlock && codeBlockIndicator) {
+        line = this.theme.fg("accent", this.truncateLine(rawLine, maxWidth, truncateAtWordBoundary));
+      } else if (smartTruncation) {
+        line = this.smartFormatLine(rawLine, maxWidth, truncateAtWordBoundary);
+      } else {
+        line = this.truncateLine(rawLine, maxWidth, truncateAtWordBoundary);
+      }
+
+      displayLines.push(truncateToWidth(line, termWidth));
+    }
+
+    // --- apply maxLines limit ---
+    if (displayLines.length > maxLines) {
+      const kept = displayLines.slice(0, maxLines);
+      const remaining = displayLines.length - maxLines;
+      kept.push(
+        truncateToWidth(
+          this.theme.fg("dim", `… +${remaining} more line${remaining !== 1 ? "s" : ""}`),
+          termWidth,
+        ),
+      );
+      return kept;
     }
 
     return displayLines;
   }
 
-  private filterSensitiveData(text: string): string {
-    let filtered = text;
-    for (const { pattern, replacement } of SENSITIVE_PATTERNS) {
-      filtered = filtered.replace(pattern, replacement);
-    }
-    // Apply custom patterns
-    if (this.config.customPatterns) {
-      for (const customPattern of this.config.customPatterns) {
-        try {
-          const regex = new RegExp(customPattern, "gi");
-          filtered = filtered.replace(regex, "[custom-redacted]");
-        } catch {
-          // Invalid pattern, skip
-        }
-      }
-    }
-    return filtered;
-  }
-
-  private smartFormatLine(line: string, maxWidth: number, truncateAtWord: boolean): string {
-    // Detect and format common patterns
+  private smartFormatLine(line: string, maxLen: number, atWord: boolean): string {
     const trimmed = line.trim();
+    let color: string | null = null;
 
-    // File paths
-    if (trimmed.match(/^[\w./~-]+\.(ts|js|py|rs|go|java|c|cpp|h|json|yaml|yml|md|txt|sh|bash|zsh|fish)$/i)) {
-      return this.theme.fg("accent", this.truncateLine(line, maxWidth, truncateAtWord));
-    }
+    if (/^[\w./~\\-]+\.[a-z]{1,12}$/i.test(trimmed)) color = "accent"; // file paths
+    else if (/^https?:\/\//i.test(trimmed)) color = "cyan"; // URLs
+    else if (/^\w+\(/.test(trimmed)) color = "yellow"; // function calls
+    else if (/error|warning|fail|exception/i.test(trimmed)) color = "error";
 
-    // URLs
-    if (trimmed.match(/^https?:\/\//i)) {
-      return this.theme.fg("cyan", this.truncateLine(line, maxWidth, truncateAtWord));
-    }
-
-    // Function/method calls
-    if (trimmed.match(/^\w+\(/)) {
-      return this.theme.fg("yellow", this.truncateLine(line, maxWidth, truncateAtWord));
-    }
-
-    // Error patterns
-    if (trimmed.match(/error|warning|fail|exception/i)) {
-      return this.theme.fg("error", this.truncateLine(line, maxWidth, truncateAtWord));
-    }
-
-    // Default: just truncate
-    return this.truncateLine(line, maxWidth, truncateAtWord);
+    const truncated = this.truncateLine(line, maxLen, atWord);
+    return color ? this.theme.fg(color, truncated) : truncated;
   }
 
-  private truncateLine(line: string, maxWidth: number, atWordBoundary: boolean): string {
-    if (line.length <= maxWidth) return line;
+  private truncateLine(line: string, maxLen: number, atWordBoundary: boolean): string {
+    if (line.length <= maxLen) return line;
 
     if (atWordBoundary) {
-      // Find last word boundary within limit
-      const truncated = line.slice(0, maxWidth - 1);
-      const lastSpace = truncated.lastIndexOf(" ");
-      const lastPunctuation = Math.max(
-        truncated.lastIndexOf("."),
-        truncated.lastIndexOf(","),
-        truncated.lastIndexOf(";"),
-        truncated.lastIndexOf(":"),
+      const head = line.slice(0, maxLen - 1);
+      const cut = Math.max(
+        head.lastIndexOf(" "),
+        head.lastIndexOf("."),
+        head.lastIndexOf(","),
+        head.lastIndexOf(";"),
+        head.lastIndexOf(":"),
       );
-      const cutPoint = Math.max(lastSpace, lastPunctuation);
-      
-      if (cutPoint > maxWidth * 0.6) {
-        return line.slice(0, cutPoint) + "…";
-      }
+      if (cut > maxLen * 0.6) return line.slice(0, cut) + "…";
     }
 
-    return line.slice(0, maxWidth - 1) + "…";
+    return line.slice(0, maxLen - 1) + "…";
   }
+}
 
-  render(width: number): string[] {
-    // Return cached if valid
-    if (this.cachedWidth === width && this.cachedLines.length > 0) {
-      return this.cachedLines;
-    }
+// ═══════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════
 
-    const allLines = this.getDisplayLines();
-    let linesToShow: string[];
+function detectCodeBlocks(text: string): boolean {
+  return text.includes("```");
+}
 
-    if (this.expanded) {
-      // Show with scroll
-      const start = this.scrollOffset;
-      const end = Math.min(start + this.config.maxLines, allLines.length);
-      linesToShow = allLines.slice(start, end);
+function determineMessageType(prompt: string, turnCount: number): "new" | "follow-up" | "edit" | "retry" {
+  if (prompt.startsWith("/edit ") || prompt.startsWith("/replace ")) return "edit";
+  if (turnCount > 0) return "follow-up";
+  return "new";
+}
 
-      // Add scroll indicator
-      if (allLines.length > this.config.maxLines) {
-        const scrollInfo = this.theme.fg(
-          "dim",
-          `[${start + 1}-${end}/${allLines.length}] ↑↓ scroll, ESC collapse`,
-        );
-        linesToShow.push(scrollInfo);
-      } else {
-        linesToShow.push(this.theme.fg("dim", "[ESC collapse]"));
-      }
-    } else {
-      // Truncated view
-      linesToShow = allLines.slice(0, this.config.maxLines);
+function serializeMetadata(m: MessageMetadata): SerializedMetadata {
+  return {
+    prompt: m.prompt,
+    timestamp: m.timestamp.toISOString(),
+    messageType: m.messageType,
+    turnNumber: m.turnNumber,
+    hasCodeBlocks: m.hasCodeBlocks,
+  };
+}
 
-      if (allLines.length > this.config.maxLines) {
-        const remaining = allLines.length - this.config.maxLines;
-        linesToShow.push(
-          this.theme.fg("dim", `… +${remaining} more line${remaining !== 1 ? "s" : ""}`),
-        );
-      }
-      
-      // Add expand hint
-      if (allLines.length > 1) {
-        linesToShow.push(this.theme.fg("dim", `[ENTER/SPACE expand]`));
-      }
-    }
-
-    // Add accessibility label (screen reader friendly)
-    const ariaLabel = `Sticky message header: ${this.expanded ? "expanded" : "collapsed"}, ${allLines.length} lines`;
-    linesToShow.unshift(this.theme.fg("dim", `<!-- ${ariaLabel} -->`));
-
-    this.cachedLines = linesToShow;
-    this.cachedWidth = width;
-
-    return linesToShow;
-  }
+function deserializeMetadata(s: SerializedMetadata): MessageMetadata {
+  return {
+    prompt: s.prompt,
+    timestamp: new Date(s.timestamp),
+    messageType: s.messageType,
+    turnNumber: s.turnNumber,
+    hasCodeBlocks: s.hasCodeBlocks,
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -356,9 +328,7 @@ export default function stickyUsermessage(pi: ExtensionAPI) {
   let currentMetadata: MessageMetadata | null = null;
   let turnCount = 0;
 
-  // ═══════════════════════════════════════════════════════════
-  // Persistence Functions
-  // ═══════════════════════════════════════════════════════════
+  // ─── Persistence ───────────────────────────────────────────
 
   function loadState(): void {
     try {
@@ -369,7 +339,7 @@ export default function stickyUsermessage(pi: ExtensionAPI) {
           const saved = entry.data as SavedState;
           config = { ...DEFAULT_CONFIG, ...saved.config };
           if (saved.lastMetadata) {
-            currentMetadata = saved.lastMetadata;
+            currentMetadata = deserializeMetadata(saved.lastMetadata);
           }
           break;
         }
@@ -383,30 +353,14 @@ export default function stickyUsermessage(pi: ExtensionAPI) {
     try {
       pi.appendEntry("sticky-config", {
         config,
-        lastMetadata: currentMetadata,
-      } as SavedState);
+        lastMetadata: currentMetadata ? serializeMetadata(currentMetadata) : undefined,
+      } satisfies SavedState);
     } catch (error) {
       console.error("Failed to save sticky header state:", error);
     }
   }
 
-  // ═══════════════════════════════════════════════════════════
-  // Helper Functions
-  // ═══════════════════════════════════════════════════════════
-
-  function detectCodeBlocks(text: string): boolean {
-    return /```[\s\S]*?```/.test(text) || text.includes("```");
-  }
-
-  function determineMessageType(
-    prompt: string,
-    isRetry: boolean = false,
-  ): "new" | "follow-up" | "edit" | "retry" {
-    if (isRetry) return "retry";
-    if (prompt.startsWith("/edit ") || prompt.startsWith("/replace ")) return "edit";
-    if (currentMetadata && turnCount > 1) return "follow-up";
-    return "new";
-  }
+  // ─── Widget management ─────────────────────────────────────
 
   function updateWidget(ctx: ExtensionContext, metadata: MessageMetadata): void {
     if (!ctx.hasUI || !config.enabled) {
@@ -414,52 +368,36 @@ export default function stickyUsermessage(pi: ExtensionAPI) {
       return;
     }
 
-    const theme = ctx.ui.theme;
-    
-    // Update existing component or create new one
+    // Create or reuse the component
     if (widgetComponent) {
       widgetComponent.updateMetadata(metadata);
+      widgetComponent.updateConfig(config);
     } else {
-      widgetComponent = new StickyWidgetComponent(
-        metadata,
-        config,
-        theme,
-        ctx.ui as any,
-        () => {
-          // Callback when expand state changes
-          // Could trigger overlay or other actions
-        },
-      );
+      widgetComponent = new StickyWidgetComponent(metadata, config, ctx.ui.theme);
     }
 
-    ctx.ui.setWidget("sticky-header", () => widgetComponent!);
+    // Factory receives fresh theme on each call, keeping colors up to date
+    ctx.ui.setWidget("sticky-header", (_tui, theme) => {
+      widgetComponent!.setTheme(theme);
+      return widgetComponent!;
+    });
   }
 
-  // ═══════════════════════════════════════════════════════════
-  // Session Start - Load State
-  // ═══════════════════════════════════════════════════════════
+  // ─── Events ────────────────────────────────────────────────
 
   pi.on("session_start", async (_event, ctx) => {
     loadState();
-    
-    // Restore widget if we have previous metadata
     if (currentMetadata && config.enabled && ctx.hasUI) {
       updateWidget(ctx, currentMetadata);
     }
   });
 
-  // ═══════════════════════════════════════════════════════════
-  // Turn Events - Track Turn Count
-  // ═══════════════════════════════════════════════════════════
-
-  pi.on("turn_start", async (_event, ctx) => {
+  pi.on("turn_start", async () => {
     turnCount++;
   });
 
-  // ═══════════════════════════════════════════════════════════
-  // Message Events - Capture User Messages
-  // ═══════════════════════════════════════════════════════════
-
+  // Single capture point — before_agent_start always fires for agent prompts.
+  // Using only this event avoids the double-capture race from input + before_agent_start.
   pi.on("before_agent_start", (event, ctx) => {
     const prompt = event.prompt.trim();
     if (!prompt) {
@@ -470,7 +408,7 @@ export default function stickyUsermessage(pi: ExtensionAPI) {
     const metadata: MessageMetadata = {
       prompt,
       timestamp: new Date(),
-      messageType: determineMessageType(prompt),
+      messageType: determineMessageType(prompt, turnCount),
       turnNumber: turnCount + 1,
       hasCodeBlocks: detectCodeBlocks(prompt),
     };
@@ -480,46 +418,24 @@ export default function stickyUsermessage(pi: ExtensionAPI) {
     saveState();
   });
 
-  // Also capture from input events for broader coverage
-  pi.on("input", (event, ctx) => {
-    if (event.type === "submit" && event.text && event.text.trim()) {
-      const prompt = event.text.trim();
-      const metadata: MessageMetadata = {
-        prompt,
-        timestamp: new Date(),
-        messageType: determineMessageType(prompt),
-        turnNumber: turnCount,
-        hasCodeBlocks: detectCodeBlocks(prompt),
-      };
-
-      currentMetadata = metadata;
-      updateWidget(ctx, metadata);
-      saveState();
-    }
-  });
-
-  // ═══════════════════════════════════════════════════════════
-  // Commands
-  // ═══════════════════════════════════════════════════════════
+  // ─── Commands ──────────────────────────────────────────────
 
   pi.registerCommand("sticky", {
     description: "Sticky header control: on|off|show|config|reset",
     handler: async (args, ctx) => {
       const arg = args.trim().toLowerCase();
-      
+
       if (arg === "on") {
         config.enabled = true;
         if (currentMetadata) updateWidget(ctx, currentMetadata);
         saveState();
         ctx.ui.notify("Sticky header: ON", "success");
-      } 
-      else if (arg === "off") {
+      } else if (arg === "off") {
         config.enabled = false;
         ctx.ui.setWidget("sticky-header", undefined);
         saveState();
         ctx.ui.notify("Sticky header: OFF", "info");
-      } 
-      else if (arg === "show") {
+      } else if (arg === "show") {
         const status = [
           `Sticky header: ${config.enabled ? "ON" : "OFF"}`,
           `  Max lines: ${config.maxLines}`,
@@ -531,70 +447,18 @@ export default function stickyUsermessage(pi: ExtensionAPI) {
           `  Filter sensitive: ${config.filterSensitive ? "ON" : "OFF"}`,
         ];
         ctx.ui.notify(status.join("\n"), "info");
-      } 
-      else if (arg === "reset") {
+      } else if (arg === "reset") {
         config = { ...DEFAULT_CONFIG };
         if (currentMetadata && config.enabled) updateWidget(ctx, currentMetadata);
         saveState();
         ctx.ui.notify("Sticky header: Reset to defaults", "success");
-      }
-      else if (arg.startsWith("config ")) {
-        // Parse config changes: /sticky config maxLines=5 showTimestamp=false
-        const changes = arg.slice(7).trim();
-        const pairs = changes.split(/\s+/);
-        
-        for (const pair of pairs) {
-          const [key, value] = pair.split("=");
-          if (!key || !value) continue;
-          
-          switch (key) {
-            case "maxLines":
-              config.maxLines = Math.max(1, Math.min(20, parseInt(value, 10)));
-              break;
-            case "maxWidth":
-              config.maxWidth = Math.max(20, Math.min(200, parseInt(value, 10)));
-              break;
-            case "showTimestamp":
-              config.showTimestamp = value === "true";
-              break;
-            case "showMessageType":
-              config.showMessageType = value === "true";
-              break;
-            case "smartTruncation":
-              config.smartTruncation = value === "true";
-              break;
-            case "codeBlockIndicator":
-              config.codeBlockIndicator = value === "true";
-              break;
-            case "prefixSymbol":
-              config.prefixSymbol = value || "▎";
-              break;
-            case "truncateAtWordBoundary":
-              config.truncateAtWordBoundary = value === "true";
-              break;
-            case "filterSensitive":
-              config.filterSensitive = value === "true";
-              break;
-            case "timestampColor":
-              config.timestampColor = value;
-              break;
-            case "metadataColor":
-              config.metadataColor = value;
-              break;
-          }
-        }
-        
-        if (widgetComponent) {
-          widgetComponent.updateConfig(config);
-        }
-        if (currentMetadata && config.enabled) {
-          updateWidget(ctx, currentMetadata);
-        }
+      } else if (arg.startsWith("config ")) {
+        applyConfigChanges(arg.slice(7).trim());
+        if (widgetComponent) widgetComponent.updateConfig(config);
+        if (currentMetadata && config.enabled) updateWidget(ctx, currentMetadata);
         saveState();
         ctx.ui.notify("Sticky header: Configuration updated", "success");
-      }
-      else {
-        // Show current status
+      } else {
         ctx.ui.notify(
           `Sticky header: ${config.enabled ? "ON" : "OFF"} (use /sticky show for details)`,
           config.enabled ? "info" : "warning",
@@ -603,7 +467,6 @@ export default function stickyUsermessage(pi: ExtensionAPI) {
     },
   });
 
-  // Additional configuration commands for quick access
   pi.registerCommand("sticky-lines", {
     description: "Set max lines to display: /sticky-lines <number>",
     handler: async (args, ctx) => {
@@ -635,4 +498,53 @@ export default function stickyUsermessage(pi: ExtensionAPI) {
       ctx.ui.notify(`Sticky header: Max width set to ${num}`, "success");
     },
   });
+
+  // ─── Config parsing ────────────────────────────────────────
+
+  function applyConfigChanges(changes: string): void {
+    const pairs = changes.split(/\s+/);
+    for (const pair of pairs) {
+      const eqIdx = pair.indexOf("=");
+      if (eqIdx < 0) continue;
+      const key = pair.slice(0, eqIdx);
+      const value = pair.slice(eqIdx + 1);
+      if (!key) continue;
+
+      switch (key) {
+        case "maxLines":
+          config.maxLines = Math.max(1, Math.min(20, parseInt(value, 10) || 3));
+          break;
+        case "maxWidth":
+          config.maxWidth = Math.max(20, Math.min(200, parseInt(value, 10) || 120));
+          break;
+        case "showTimestamp":
+          config.showTimestamp = value === "true";
+          break;
+        case "showMessageType":
+          config.showMessageType = value === "true";
+          break;
+        case "smartTruncation":
+          config.smartTruncation = value === "true";
+          break;
+        case "codeBlockIndicator":
+          config.codeBlockIndicator = value === "true";
+          break;
+        case "prefixSymbol":
+          config.prefixSymbol = value || "▎";
+          break;
+        case "truncateAtWordBoundary":
+          config.truncateAtWordBoundary = value === "true";
+          break;
+        case "filterSensitive":
+          config.filterSensitive = value === "true";
+          break;
+        case "timestampColor":
+          config.timestampColor = value;
+          break;
+        case "metadataColor":
+          config.metadataColor = value;
+          break;
+      }
+    }
+  }
 }

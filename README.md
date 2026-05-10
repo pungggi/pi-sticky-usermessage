@@ -1,6 +1,6 @@
 # pi-sticky-usermessage
 
-Enhanced sticky header that shows your last user message above the editor in [Pi](https://pi.dev) coding agent. Features persistence, interactivity, smart formatting, and more.
+Sticky header that shows your last user message above the editor in [Pi](https://pi.dev) coding agent. Features persistence, smart formatting, and sensitive data filtering.
 
 ## What it does
 
@@ -10,21 +10,19 @@ After you send a prompt, a persistent bar above the input editor shows your mess
 ▎ 14:32 · ● new </>
   Fix the auth middleware to handle expired tokens properly
   and add a retry with exponential backoff to the client
-[ENTER/SPACE expand]
 ```
 
 ## Features
 
-### ✨ Core Features
+### ✨ Core
 - **Persistent Configuration**: Settings saved across sessions
-- **Interactive Widget**: Expand/collapse with keyboard (ENTER/SPACE/ESC)
-- **Scrollable View**: Navigate long messages with ↑↓ arrows
-- **Smart Truncation**: Word-boundary aware, doesn't cut important words
+- **Smart Truncation**: Word-boundary aware, respects max lines
 - **Syntax Awareness**: Highlights file paths, URLs, functions, errors
+- **Overflow Indicator**: Shows `… +N more lines` when message exceeds display
 
 ### 🎨 Customization
 - **Timestamp Display**: Show when the message was sent
-- **Message Type Indicators**: ● new, → follow-up, ✎ edit, ↺ retry
+- **Message Type Indicators**: ● new, → follow-up, ✎ edit
 - **Code Block Detection**: Shows `</>` marker when code is present
 - **Custom Prefix Symbol**: Change the `▎` to any character
 - **Theme-Aware Colors**: Uses your active Pi theme colors
@@ -33,11 +31,6 @@ After you send a prompt, a persistent bar above the input editor shows your mess
 - **Sensitive Data Filtering**: Automatically redacts emails, API keys, passwords, IPs
 - **Custom Patterns**: Add your own regex patterns for redaction
 - **Toggle Filtering**: Enable/disable per your needs
-
-### ♿ Accessibility
-- **Screen Reader Labels**: ARIA-like comments for assistive tech
-- **Keyboard Navigation**: Full keyboard control, no mouse needed
-- **Clear Visual Cues**: Expand/collapse states are obvious
 
 ## Install
 
@@ -54,14 +47,6 @@ pi -e ./src/index.ts
 ## Usage
 
 The header is **on by default** after installation.
-
-### Keyboard Controls (when widget has focus)
-
-| Key | Action |
-|-----|--------|
-| `ENTER` / `SPACE` / `E` | Toggle expand/collapse |
-| `↑` / `↓` | Scroll through expanded message |
-| `ESC` | Collapse (when expanded) |
 
 ### Commands
 
@@ -94,8 +79,6 @@ The header is **on by default** after installation.
 
 ## Configuration Options
 
-Edit via `/sticky config <key>=<value>` or modify defaults in code:
-
 | Key | Default | Description |
 |-----|---------|-------------|
 | `enabled` | `true` | Start enabled |
@@ -119,12 +102,11 @@ The extension automatically detects and redacts:
 - **Email addresses**: `user@example.com` → `[email]`
 - **IP addresses**: `192.168.1.1` → `[ip]`
 - **Phone numbers**: `(555) 123-4567` → `[phone]`
-- **API keys**: `sk-abc123...` → `[sk-key]`
+- **API keys**: `sk-abc123...` → `[key]`
 - **Bearer tokens**: `Bearer xyz` → `Bearer [token]`
 - **Passwords**: `password: secret123` → `password [redacted]`
 - **API keys**: `api_key: abc123` → `api_key [redacted]`
 - **Secrets**: `secret: xyz` → `secret [redacted]`
-- **Long alphanumeric strings**: Likely tokens/keys → `[key]`
 
 ### Custom Patterns
 
@@ -146,67 +128,18 @@ When `smartTruncation` is enabled, the extension highlights:
 - **Function calls**: `fetchData()` (yellow color)
 - **Errors/warnings**: `Error: failed` (error color)
 
-## Event Handling
-
-The extension captures messages from multiple events for comprehensive coverage:
-
-- `before_agent_start` - When agent starts processing
-- `input` - When you submit from the editor
-
-This ensures messages are captured regardless of how they're sent.
-
 ## Theme Colors
 
 The extension uses these Pi theme color names:
 
-- `accent` - Primary accent color
-- `muted` - Muted text color
-- `dim` - Dimmed text color
-- `success` - Success messages
-- `warning` - Warning messages
-- `error` - Error messages
-- `cyan` - Cyan color
-- `yellow` - Yellow color
-
-## Examples
-
-### Basic Usage
-
-```
-You: /sticky on
-You: Fix the authentication bug
-[Header shows your message with timestamp]
-```
-
-### Expanding Long Messages
-
-```
-You: Write a comprehensive guide about...
-[Header shows first 3 lines]
-[Press ENTER to expand]
-[Header shows full message with scroll]
-[Use ↑↓ to navigate, ESC to collapse]
-```
-
-### Configuration
-
-```
-You: /sticky show
-[Shows all current settings]
-
-You: /sticky config maxLines=5 filterSensitive=false
-[Updates configuration and saves]
-
-You: /sticky-lines 7
-[Quick way to set max lines]
-```
-
-### Privacy Mode
-
-```
-You: /sticky config filterSensitive=true showTimestamp=false
-[Redacts sensitive data, hides timestamps]
-```
+| Color | Usage |
+|-------|-------|
+| `accent` | Code block markers, file paths |
+| `muted` | Metadata, message type |
+| `dim` | Timestamps, overflow indicator |
+| `cyan` | URLs |
+| `yellow` | Function calls |
+| `error` | Error/warning patterns |
 
 ## Technical Details
 
@@ -223,17 +156,9 @@ pi.appendEntry("sticky-config", {
 
 State is automatically restored on `session_start`.
 
-### Widget Component
+### Event Capture
 
-The widget is a custom `StickyWidgetComponent` implementing the Pi TUI `Component` interface:
-
-- `render(width: number): string[]` - Renders the widget
-- `handleInput(data: string): void` - Handles keyboard input
-- `invalidate(): void` - Clears cached rendering
-
-### Multi-Event Capture
-
-Messages are captured from both `before_agent_start` and `input` events to ensure comprehensive coverage.
+Messages are captured from the `before_agent_start` event, which fires for every prompt that reaches the agent.
 
 ## Troubleshooting
 
@@ -248,26 +173,15 @@ Messages are captured from both `before_agent_start` and `input` events to ensur
 - Try `/sticky reset` then reconfigure
 
 ### Sensitive data not filtered
-- Verify `filterSensitive: true`
+- Verify `filterSensitive: true` via `/sticky show`
 - Check if custom patterns are needed
 - Test with known patterns (email, API key)
 
 ### Text not truncating correctly
-- Check `maxWidth` setting
+- Check `maxWidth` setting via `/sticky show`
 - Verify `truncateAtWordBoundary` is set as desired
 - Try adjusting `maxLines` for better fit
 
 ## License
 
 MIT
-
-## Contributing
-
-Contributions welcome! Areas for improvement:
-
-- More syntax highlighting patterns
-- Additional sensitive data patterns
-- Click-to-copy functionality
-- Message history navigation
-- Export/import configurations
-- Theme presets

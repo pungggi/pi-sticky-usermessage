@@ -1,6 +1,6 @@
 {
   "name": "pi-sticky-usermessage",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "description": "Sticky header showing your last user message above the editor in Pi coding agent",
   "keywords": [
     "pi-package",
