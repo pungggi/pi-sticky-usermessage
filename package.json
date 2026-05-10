@@ -1,0 +1,25 @@
+{
+  "name": "pi-sticky-usermessage",
+  "version": "1.0.0",
+  "description": "Sticky header showing your last user message above the editor in Pi coding agent",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "sticky-header",
+    "user-message"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.74.0"
+  }
+}
