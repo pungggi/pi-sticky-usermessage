@@ -9,6 +9,14 @@
     "user-message"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pungggi/pi-sticky-usermessage.git"
+  },
+  "homepage": "https://github.com/pungggi/pi-sticky-usermessage#readme",
+  "bugs": {
+    "url": "https://github.com/pungggi/pi-sticky-usermessage/issues"
+  },
   "type": "module",
   "files": [
     "src",
