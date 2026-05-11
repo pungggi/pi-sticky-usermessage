@@ -6,7 +6,7 @@
  * Local:    pi -e ./src/index.ts
  */
 
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 
 // ═══════════════════════════════════════════════════════════════
@@ -25,15 +25,14 @@ interface StickyConfig {
   truncateAtWordBoundary: boolean;
   filterSensitive: boolean;
   customPatterns?: string[];
-  timestampColor: string;
-  metadataColor: string;
+  timestampColor: ThemeColor;
+  metadataColor: ThemeColor;
 }
 
 interface MessageMetadata {
   prompt: string;
   timestamp: Date;
   messageType: "new" | "follow-up" | "edit" | "retry";
-  turnNumber: number;
   hasCodeBlocks: boolean;
 }
 
@@ -42,7 +41,6 @@ interface SerializedMetadata {
   prompt: string;
   timestamp: string;
   messageType: "new" | "follow-up" | "edit" | "retry";
-  turnNumber: number;
   hasCodeBlocks: boolean;
 }
 
@@ -88,7 +86,8 @@ interface SensitivePatternDef {
 const SENSITIVE_PATTERN_DEFS: readonly SensitivePatternDef[] = [
   { source: "\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}\\b", flags: "g", replacement: "[email]" },
   { source: "\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b", flags: "g", replacement: "[ip]" },
-  { source: "\\b(?:\\+?1[-.\\s]?)?\\(?\\d{3}\\)?[-.\\s]?\\d{3}[-.\\s]?\\d{4}\\b", flags: "g", replacement: "[phone]" },
+  // International phone with optional country code and flexible separators.
+  { source: "\\b(?:\\+\\d{1,3}[-.\\s]?)?\\(?\\d{2,4}\\)?[-.\\s]?\\d{2,4}[-.\\s]?\\d{3,6}\\b", flags: "g", replacement: "[phone]" },
   // Prefixed secrets only — avoids false positives on long identifiers / hashes
   { source: "\\b(?:sk-|ghp_|gho_|github_pat_|xox[bpsa]-)[A-Za-z0-9_-]{20,}\\b", flags: "g", replacement: "[key]" },
   { source: "Bearer\\s+[A-Za-z0-9._-]+", flags: "gi", replacement: "Bearer [token]" },
@@ -101,7 +100,7 @@ const SENSITIVE_PATTERN_DEFS: readonly SensitivePatternDef[] = [
 /** Max source length for custom regex patterns to mitigate ReDoS. */
 const MAX_CUSTOM_PATTERN_LENGTH = 200;
 
-function filterSensitiveData(text: string, customPatterns?: string[]): string {
+export function filterSensitiveData(text: string, customPatterns?: string[]): string {
   let filtered = text;
 
   for (const def of SENSITIVE_PATTERN_DEFS) {
@@ -120,6 +119,39 @@ function filterSensitiveData(text: string, customPatterns?: string[]): string {
   }
 
   return filtered;
+}
+
+/**
+ * Split the prompt into lines and filter sensitive data only on lines
+ * outside code fences. Lines inside ``` fences are left intact so that
+ * code-snippet examples are not mangled.
+ */
+export function filterPromptLines(
+  prompt: string,
+  shouldFilter: boolean,
+  customPatterns?: string[],
+): string[] {
+  const allLines = prompt.split("\n");
+  if (!shouldFilter) return allLines;
+
+  const result: string[] = [];
+  let insideFence = false;
+
+  for (const line of allLines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("```")) {
+      insideFence = !insideFence;
+      result.push(line); // keep fence markers as-is
+      continue;
+    }
+    if (insideFence) {
+      result.push(line); // inside code block — don't filter
+      continue;
+    }
+    result.push(filterSensitiveData(line, customPatterns));
+  }
+
+  return result;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -189,13 +221,9 @@ class StickyWidgetComponent {
       metadataColor,
     } = this.config;
 
-    // --- sensitive data ---
-    let text = prompt;
-    if (shouldFilter) {
-      text = filterSensitiveData(text, this.config.customPatterns);
-    }
+    // --- sensitive data (code-fence-aware) ---
+    const rawLines = filterPromptLines(prompt, shouldFilter, this.config.customPatterns);
 
-    const rawLines = text.split("\n");
     const displayLines: string[] = [];
 
     // --- metadata line ---
@@ -254,12 +282,21 @@ class StickyWidgetComponent {
 
   private smartFormatLine(line: string, maxLen: number, atWord: boolean): string {
     const trimmed = line.trim();
-    let color: string | null = null;
+    let color: ThemeColor | null = null;
 
-    if (/^[\w./~\\-]+\.[a-z]{1,12}$/i.test(trimmed)) color = "accent"; // file paths
-    else if (/^https?:\/\//i.test(trimmed)) color = "cyan"; // URLs
-    else if (/^\w+\(/.test(trimmed)) color = "yellow"; // function calls
-    else if (/error|warning|fail|exception/i.test(trimmed)) color = "error";
+    // Standalone file path on its own line, or inline path with directory separator.
+    if (
+      /^[\w./~\\-]+\.[a-z]{1,12}$/i.test(trimmed) ||
+      /[\w./~\\-]*\/[\w./~\\-]+\.[a-z]{1,12}\b/i.test(trimmed)
+    ) {
+      color = "accent";
+    } else if (/^https?:\/\//i.test(trimmed)) {
+      color = "mdLink"; // URLs
+    } else if (/^\w+\(/.test(trimmed)) {
+      color = "syntaxFunction"; // function calls
+    } else if (/error|warning|fail|exception/i.test(trimmed)) {
+      color = "error";
+    }
 
     const truncated = this.truncateLine(line, maxLen, atWord);
     return color ? this.theme.fg(color, truncated) : truncated;
@@ -277,6 +314,8 @@ class StickyWidgetComponent {
         head.lastIndexOf(";"),
         head.lastIndexOf(":"),
       );
+      // Only use the word-boundary cut if the resulting line is > 60 % of maxLen;
+      // otherwise the shortened line would feel too abrupt — fall back to hard truncation.
       if (cut > maxLen * 0.6) return line.slice(0, cut) + "…";
     }
 
@@ -288,34 +327,157 @@ class StickyWidgetComponent {
 // Helpers
 // ═══════════════════════════════════════════════════════════════
 
-function detectCodeBlocks(text: string): boolean {
+export function detectCodeBlocks(text: string): boolean {
   return text.includes("```");
 }
 
-function determineMessageType(prompt: string, turnCount: number): "new" | "follow-up" | "edit" | "retry" {
-  if (prompt.startsWith("/edit ") || prompt.startsWith("/replace ")) return "edit";
-  if (turnCount > 0) return "follow-up";
+export function determineMessageType(prompt: string): "new" | "follow-up" | "edit" | "retry" {
+  const normalized = prompt.trim().toLowerCase();
+
+  if (/^\/(?:edit|replace)(?:\s|$)/.test(normalized)) return "edit";
+  if (/^\/retry(?:\s|$)/.test(normalized)) return "retry";
+
+  // Be conservative: an arbitrary later prompt in the same session is not
+  // necessarily a follow-up. Only mark it as one when the prompt explicitly
+  // reads like a continuation of the previous turn.
+  if (
+    /^(?:also|and|then|next|additionally|one more thing|another thing|continue|keep going|what about)\b/.test(
+      normalized,
+    ) ||
+    /^(?:can you also|could you also|please also|regarding (?:that|this|the above)|about (?:that|this|the above)|for that|in that case|same for)\b/.test(
+      normalized,
+    )
+  ) {
+    return "follow-up";
+  }
+
   return "new";
 }
 
-function serializeMetadata(m: MessageMetadata): SerializedMetadata {
+export function serializeMetadata(m: MessageMetadata): SerializedMetadata {
   return {
     prompt: m.prompt,
     timestamp: m.timestamp.toISOString(),
     messageType: m.messageType,
-    turnNumber: m.turnNumber,
     hasCodeBlocks: m.hasCodeBlocks,
   };
 }
 
-function deserializeMetadata(s: SerializedMetadata): MessageMetadata {
+export function deserializeMetadata(s: SerializedMetadata): MessageMetadata {
   return {
     prompt: s.prompt,
     timestamp: new Date(s.timestamp),
     messageType: s.messageType,
-    turnNumber: s.turnNumber,
     hasCodeBlocks: s.hasCodeBlocks,
   };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Config helpers
+// ═══════════════════════════════════════════════════════════════
+
+/** Valid ThemeColor values from Pi's theme system. */
+const VALID_COLORS: ReadonlySet<string> = new Set<ThemeColor>([
+  "accent",
+  "border",
+  "borderAccent",
+  "borderMuted",
+  "success",
+  "error",
+  "warning",
+  "muted",
+  "dim",
+  "text",
+  "thinkingText",
+  "userMessageText",
+  "customMessageText",
+  "customMessageLabel",
+  "toolTitle",
+  "toolOutput",
+  "mdHeading",
+  "mdLink",
+  "mdLinkUrl",
+  "mdCode",
+  "mdCodeBlock",
+  "mdCodeBlockBorder",
+  "mdQuote",
+  "mdQuoteBorder",
+  "mdHr",
+  "mdListBullet",
+  "toolDiffAdded",
+  "toolDiffRemoved",
+  "toolDiffContext",
+  "syntaxComment",
+  "syntaxKeyword",
+  "syntaxFunction",
+  "syntaxVariable",
+  "syntaxString",
+  "syntaxNumber",
+  "syntaxType",
+  "syntaxOperator",
+  "syntaxPunctuation",
+  "thinkingOff",
+  "thinkingMinimal",
+  "thinkingLow",
+  "thinkingMedium",
+  "thinkingHigh",
+  "thinkingXhigh",
+  "bashMode",
+]);
+
+function parseConfigKey(key: string, value: string, config: StickyConfig): boolean {
+  // Strip enclosing quotes from string values.
+  const clean = value.replace(/^["']|["']$/g, "");
+
+  switch (key) {
+    case "maxLines":
+      config.maxLines = Math.max(1, Math.min(20, parseInt(clean, 10) || 3));
+      return true;
+    case "maxWidth":
+      config.maxWidth = Math.max(20, Math.min(200, parseInt(clean, 10) || 120));
+      return true;
+    case "showTimestamp":
+      config.showTimestamp = clean === "true";
+      return true;
+    case "showMessageType":
+      config.showMessageType = clean === "true";
+      return true;
+    case "smartTruncation":
+      config.smartTruncation = clean === "true";
+      return true;
+    case "codeBlockIndicator":
+      config.codeBlockIndicator = clean === "true";
+      return true;
+    case "prefixSymbol":
+      config.prefixSymbol = clean || "▎";
+      return true;
+    case "truncateAtWordBoundary":
+      config.truncateAtWordBoundary = clean === "true";
+      return true;
+    case "filterSensitive":
+      config.filterSensitive = clean === "true";
+      return true;
+    case "customPatterns":
+      // Comma-separated regex patterns.
+      config.customPatterns = clean
+        ? clean.split(",").map((p) => p.trim()).filter(Boolean)
+        : undefined;
+      return true;
+    case "timestampColor":
+      if (VALID_COLORS.has(clean)) {
+        config.timestampColor = clean as ThemeColor;
+        return true;
+      }
+      return false;
+    case "metadataColor":
+      if (VALID_COLORS.has(clean)) {
+        config.metadataColor = clean as ThemeColor;
+        return true;
+      }
+      return false;
+    default:
+      return false;
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -326,15 +488,13 @@ export default function stickyUsermessage(pi: ExtensionAPI) {
   let config: StickyConfig = { ...DEFAULT_CONFIG };
   let widgetComponent: StickyWidgetComponent | null = null;
   let currentMetadata: MessageMetadata | null = null;
-  let turnCount = 0;
 
   // ─── Persistence ───────────────────────────────────────────
 
-  function loadState(): void {
+  function loadState(entries: readonly { type: string; customType?: string; data?: unknown }[]): void {
     try {
-      const entries = pi.getEntries?.() || [];
-      for (let i = entries.length - 1; i >= 0; i--) {
-        const entry = entries[i];
+      // Find the last sticky-config entry.
+      for (const entry of [...entries].reverse()) {
         if (entry.type === "custom" && entry.customType === "sticky-config") {
           const saved = entry.data as SavedState;
           config = { ...DEFAULT_CONFIG, ...saved.config };
@@ -376,24 +536,21 @@ export default function stickyUsermessage(pi: ExtensionAPI) {
       widgetComponent = new StickyWidgetComponent(metadata, config, ctx.ui.theme);
     }
 
-    // Factory receives fresh theme on each call, keeping colors up to date
+    // Capture local reference to avoid non-null assertions in the factory.
+    const comp = widgetComponent;
     ctx.ui.setWidget("sticky-header", (_tui, theme) => {
-      widgetComponent!.setTheme(theme);
-      return widgetComponent!;
+      comp.setTheme(theme);
+      return comp;
     });
   }
 
   // ─── Events ────────────────────────────────────────────────
 
   pi.on("session_start", async (_event, ctx) => {
-    loadState();
+    loadState(ctx.sessionManager.getEntries());
     if (currentMetadata && config.enabled && ctx.hasUI) {
       updateWidget(ctx, currentMetadata);
     }
-  });
-
-  pi.on("turn_start", async () => {
-    turnCount++;
   });
 
   // Single capture point — before_agent_start always fires for agent prompts.
@@ -408,8 +565,7 @@ export default function stickyUsermessage(pi: ExtensionAPI) {
     const metadata: MessageMetadata = {
       prompt,
       timestamp: new Date(),
-      messageType: determineMessageType(prompt, turnCount),
-      turnNumber: turnCount + 1,
+      messageType: determineMessageType(prompt),
       hasCodeBlocks: detectCodeBlocks(prompt),
     };
 
@@ -429,13 +585,14 @@ export default function stickyUsermessage(pi: ExtensionAPI) {
         config.enabled = true;
         if (currentMetadata) updateWidget(ctx, currentMetadata);
         saveState();
-        ctx.ui.notify("Sticky header: ON", "success");
+        ctx.ui.notify("Sticky header: ON", "info");
       } else if (arg === "off") {
         config.enabled = false;
         ctx.ui.setWidget("sticky-header", undefined);
         saveState();
         ctx.ui.notify("Sticky header: OFF", "info");
       } else if (arg === "show") {
+        const customCount = config.customPatterns?.length ?? 0;
         const status = [
           `Sticky header: ${config.enabled ? "ON" : "OFF"}`,
           `  Max lines: ${config.maxLines}`,
@@ -445,19 +602,29 @@ export default function stickyUsermessage(pi: ExtensionAPI) {
           `  Smart truncation: ${config.smartTruncation ? "ON" : "OFF"}`,
           `  Word boundary: ${config.truncateAtWordBoundary ? "ON" : "OFF"}`,
           `  Filter sensitive: ${config.filterSensitive ? "ON" : "OFF"}`,
+          `  Custom patterns: ${customCount} (${customCount > 0 ? config.customPatterns!.join(", ") : "none"})`,
+          `  Timestamp color: ${config.timestampColor}`,
+          `  Metadata color: ${config.metadataColor}`,
         ];
         ctx.ui.notify(status.join("\n"), "info");
       } else if (arg === "reset") {
         config = { ...DEFAULT_CONFIG };
         if (currentMetadata && config.enabled) updateWidget(ctx, currentMetadata);
         saveState();
-        ctx.ui.notify("Sticky header: Reset to defaults", "success");
+        ctx.ui.notify("Sticky header: Reset to defaults", "info");
       } else if (arg.startsWith("config ")) {
-        applyConfigChanges(arg.slice(7).trim());
+        const errors = applyConfigChanges(arg.slice(7).trim());
         if (widgetComponent) widgetComponent.updateConfig(config);
         if (currentMetadata && config.enabled) updateWidget(ctx, currentMetadata);
         saveState();
-        ctx.ui.notify("Sticky header: Configuration updated", "success");
+        if (errors.length > 0) {
+          ctx.ui.notify(
+            `Sticky header: Configuration updated (${errors.length} invalid key${errors.length !== 1 ? "s" : ""}: ${errors.join(", ")})`,
+            "warning",
+          );
+        } else {
+          ctx.ui.notify("Sticky header: Configuration updated", "info");
+        }
       } else {
         ctx.ui.notify(
           `Sticky header: ${config.enabled ? "ON" : "OFF"} (use /sticky show for details)`,
@@ -479,7 +646,7 @@ export default function stickyUsermessage(pi: ExtensionAPI) {
       if (widgetComponent) widgetComponent.updateConfig(config);
       if (currentMetadata && config.enabled) updateWidget(ctx, currentMetadata);
       saveState();
-      ctx.ui.notify(`Sticky header: Max lines set to ${num}`, "success");
+      ctx.ui.notify(`Sticky header: Max lines set to ${num}`, "info");
     },
   });
 
@@ -495,13 +662,14 @@ export default function stickyUsermessage(pi: ExtensionAPI) {
       if (widgetComponent) widgetComponent.updateConfig(config);
       if (currentMetadata && config.enabled) updateWidget(ctx, currentMetadata);
       saveState();
-      ctx.ui.notify(`Sticky header: Max width set to ${num}`, "success");
+      ctx.ui.notify(`Sticky header: Max width set to ${num}`, "info");
     },
   });
 
   // ─── Config parsing ────────────────────────────────────────
 
-  function applyConfigChanges(changes: string): void {
+  function applyConfigChanges(changes: string): string[] {
+    const errors: string[] = [];
     const pairs = changes.split(/\s+/);
     for (const pair of pairs) {
       const eqIdx = pair.indexOf("=");
@@ -510,41 +678,10 @@ export default function stickyUsermessage(pi: ExtensionAPI) {
       const value = pair.slice(eqIdx + 1);
       if (!key) continue;
 
-      switch (key) {
-        case "maxLines":
-          config.maxLines = Math.max(1, Math.min(20, parseInt(value, 10) || 3));
-          break;
-        case "maxWidth":
-          config.maxWidth = Math.max(20, Math.min(200, parseInt(value, 10) || 120));
-          break;
-        case "showTimestamp":
-          config.showTimestamp = value === "true";
-          break;
-        case "showMessageType":
-          config.showMessageType = value === "true";
-          break;
-        case "smartTruncation":
-          config.smartTruncation = value === "true";
-          break;
-        case "codeBlockIndicator":
-          config.codeBlockIndicator = value === "true";
-          break;
-        case "prefixSymbol":
-          config.prefixSymbol = value || "▎";
-          break;
-        case "truncateAtWordBoundary":
-          config.truncateAtWordBoundary = value === "true";
-          break;
-        case "filterSensitive":
-          config.filterSensitive = value === "true";
-          break;
-        case "timestampColor":
-          config.timestampColor = value;
-          break;
-        case "metadataColor":
-          config.metadataColor = value;
-          break;
+      if (!parseConfigKey(key, value, config)) {
+        errors.push(key);
       }
     }
+    return errors;
   }
 }

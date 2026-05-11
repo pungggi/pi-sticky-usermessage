@@ -22,6 +22,11 @@
     "src",
     "README.md"
   ],
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
   "pi": {
     "extensions": [
       "./src/index.ts"
@@ -29,5 +34,9 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.74.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0"
   }
 }
