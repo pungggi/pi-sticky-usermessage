@@ -20,12 +20,14 @@
   "type": "module",
   "files": [
     "src",
+    "docs",
     "README.md"
   ],
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "node -e \"if(!process.env.CI)throw new Error('publish via release.yml CI: push a v* tag. Manual npm publish is blocked.')\""
   },
   "pi": {
     "extensions": [
@@ -38,5 +40,9 @@
   "devDependencies": {
     "typescript": "^5.5.0",
     "vitest": "^2.0.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   }
 }
