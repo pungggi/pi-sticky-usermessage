@@ -556,7 +556,13 @@ export default function stickyUsermessage(pi: ExtensionAPI) {
   // Single capture point — before_agent_start always fires for agent prompts.
   // Using only this event avoids the double-capture race from input + before_agent_start.
   pi.on("before_agent_start", (event, ctx) => {
-    const prompt = event.prompt.trim();
+    // Runs started by custom messages (pi.sendMessage with triggerTurn) carry
+    // no user prompt. The header tracks the last *user* prompt, so leave the
+    // widget untouched instead of crashing on undefined.
+    const rawPrompt = (event as { prompt?: unknown }).prompt;
+    if (typeof rawPrompt !== "string") return;
+
+    const prompt = rawPrompt.trim();
     if (!prompt) {
       ctx.ui.setWidget("sticky-header", undefined);
       return;

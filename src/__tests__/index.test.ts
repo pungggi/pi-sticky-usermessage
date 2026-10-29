@@ -1,5 +1,6 @@
-import { describe, it, expect } from "vitest";
-import {
+import { describe, it, expect, vi } from "vitest";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import stickyUsermessage, {
   filterSensitiveData,
   filterPromptLines,
   detectCodeBlocks,
@@ -190,5 +191,86 @@ describe("serializeMetadata / deserializeMetadata", () => {
       const restored = deserializeMetadata(serializeMetadata(meta));
       expect(restored.messageType).toBe(type);
     }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// before_agent_start handler
+// Regression: pi fires this event for custom-message runs with NO prompt.
+// ═══════════════════════════════════════════════════════════════
+
+describe("before_agent_start handler", () => {
+  function createHarness() {
+    const handlers = new Map<string, (event: unknown, ctx: unknown) => void>();
+    const appended: Array<{ customType: string; data: unknown }> = [];
+    const setWidget = vi.fn();
+    const notify = vi.fn();
+
+    const pi = {
+      on: (event: string, handler: (event: unknown, ctx: unknown) => void) => {
+        handlers.set(event, handler);
+      },
+      registerCommand: () => {},
+      appendEntry: (customType: string, data: unknown) => {
+        appended.push({ customType, data });
+      },
+    } as unknown as ExtensionAPI;
+
+    const ctx = {
+      hasUI: true,
+      ui: { setWidget, notify, theme: {} },
+      sessionManager: { getEntries: () => [] },
+    } as unknown as ExtensionContext;
+
+    stickyUsermessage(pi);
+    return { handlers, appended, setWidget, ctx };
+  }
+
+  it("ignores custom-message runs (no prompt) without crashing", () => {
+    const { handlers, appended, setWidget, ctx } = createHarness();
+    const handler = handlers.get("before_agent_start")!;
+
+    // pi fires before_agent_start with messageType "custom" and no prompt
+    // when pi.sendMessage(..., { triggerTurn: true }) starts a run.
+    const customEvent = {
+      type: "before_agent_start",
+      messageType: "custom",
+      message: { customType: "test-note", content: "note" },
+    };
+
+    expect(() => handler(customEvent, ctx)).not.toThrow();
+    expect(setWidget).not.toHaveBeenCalled();
+    expect(appended).toHaveLength(0);
+  });
+
+  it("captures user prompt runs and persists metadata", () => {
+    const { handlers, appended, setWidget, ctx } = createHarness();
+    const handler = handlers.get("before_agent_start")!;
+
+    const userEvent = {
+      type: "before_agent_start",
+      messageType: "user",
+      prompt: "Fix the auth bug",
+    };
+
+    expect(() => handler(userEvent, ctx)).not.toThrow();
+    expect(setWidget).toHaveBeenCalledWith("sticky-header", expect.any(Function));
+    expect(appended).toHaveLength(1);
+    const saved = appended[0]!.data as { lastMetadata?: { prompt: string } };
+    expect(saved.lastMetadata?.prompt).toBe("Fix the auth bug");
+  });
+
+  it("clears the widget for empty user prompts", () => {
+    const { handlers, setWidget, ctx } = createHarness();
+    const handler = handlers.get("before_agent_start")!;
+
+    const emptyEvent = {
+      type: "before_agent_start",
+      messageType: "user",
+      prompt: "   ",
+    };
+
+    expect(() => handler(emptyEvent, ctx)).not.toThrow();
+    expect(setWidget).toHaveBeenCalledWith("sticky-header", undefined);
   });
 });
